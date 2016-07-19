@@ -1,0 +1,537 @@
+<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+
+ <title>tus.io</title>
+ <link href="/atom.xml" rel="self"/>
+ <link href="http://tus.io"/>
+ <updated>2016-07-19T14:45:09+02:00</updated>
+ <id>http://tus.io</id>
+
+ 
+ 
+ <entry>
+   <author>
+     <name>Marius Kleidl</name>
+     <email>marius@transloadit.com</email>
+   </author>
+   <title>S3 as a Storage Back-End</title>
+   <link href="http://tus.io/blog/2016/03/07/tus-s3-backend"/>
+   <updated>2016-03-07T00:00:00+01:00</updated>
+   <id>http://tus.io/blog/2016/03/07/tus-s3-backend</id>
+   <content type="html">&lt;p&gt;With their Simple Storage System (S3), Amazon Web Services has built one of the major providers of cloud storage for applications ranging from small side projects to enterprise systems. Since the introduction of flexible storage back-ends for the official &lt;a href=&quot;https://github.com/tus/tusd&quot;&gt;tusd&lt;/a&gt; server, an integration with S3 has been a much desired feature by our users. We are happy to announce that we are now able to &lt;a href=&quot;https://godoc.org/github.com/tus/tusd/s3store&quot;&gt;deliver&lt;/a&gt; on this request. During the time it took to create this, we had to deal with various peculiarities of Amazon’s service and were able to gain a lot of experience. In this post, we want to focus on the downsides of building a tus server on top of S3 and share some of our recently acquired knowledge with you.&lt;/p&gt;
+
+&lt;h2 id=&quot;immutable-objects&quot;&gt;Immutable Objects&lt;/h2&gt;
+
+&lt;p&gt;We, as the designers of tus, have to admit that the protocol uses a data model which is mostly incompatible with AWS S3. In order to understand this sentence, we need to make a small comparison: In tus, when you want to move a file to a remote location, you first create a new upload resource without pushing any of the file’s data to the server. It is even possible to make this operation before you know the length or size of the entire object that you want to transfer. After this step, you are free to upload the data in chunks of any size. The first chunk could be a few MBs, followed by one that is just 100 bytes and a final upload then contains the remaining GB. While this freedom introduces the need for a flexible server implementation, which is capable of handling chunks of any size, it also lays the foundation for tus’ core feature: &lt;strong&gt;resumability of an upload at any given time&lt;/strong&gt;.&lt;/p&gt;
+
+&lt;p&gt;S3, however, does not offer this flexibility: once an object - the length of which must also be known beforehand – has been uploaded to a specific location, you are unable to modify its content without transmitting the entire new file. It is simply not possible to add a chunk to an existing object without having to perform additional operations. It may sound, then, as if the main requirement of the tus protocol is not met by Amazon’s service, but that is not the case. You are certainly able to build a proper server implementation for tus, as long as you are willing to accept certain restrictions. This can, for instance, be seen in the &lt;a href=&quot;https://godoc.org/github.com/tus/tusd/s3store&quot;&gt;S3 storage back-end&lt;/a&gt; for the &lt;a href=&quot;https://github.com/tus/tusd&quot;&gt;tusd&lt;/a&gt; server.&lt;/p&gt;
+
+&lt;h2 id=&quot;multipart-uploads&quot;&gt;Multipart Uploads&lt;/h2&gt;
+
+&lt;p&gt;Amazon has been aware of this limitation and therefore supports an alternative approach called &lt;a href=&quot;http://docs.aws.amazon.com/AmazonS3/latest/dev/uploadobjusingmpu.html&quot;&gt;Multipart Uploads&lt;/a&gt;:&lt;/p&gt;
+
+&lt;blockquote&gt;
+  &lt;p&gt;Multipart upload allows you to upload a single object as a set of parts. Each part is a contiguous portion of the object’s data. You can upload these object parts independently and in any order. If transmission of any part fails, you can retransmit that part without affecting other parts. After all parts of your object are uploaded, Amazon S3 assembles these parts and creates the object.&lt;/p&gt;
+&lt;/blockquote&gt;
+
+&lt;p&gt;This approach is very similar to tus’ data model described above and it provides a solid foundation to build an implementation upon. However, development would not be called development if it were as easy as mapping a tus upload one-to-one to a multipart upload. The issue is that Amazon sets &lt;a href=&quot;http://docs.aws.amazon.com/AmazonS3/latest/dev/qfacts.html&quot;&gt;certain restrictions&lt;/a&gt;, the most notable of which is that the minimum size of a single part is limited to 5MB. The only exception to this rule is the last part, which can be smaller. It should be mentioned here that S3 will not complain when you upload a part that is smaller than 5MB, but only when you attempt to finish the multipart upload that does the actual assembly (it will then present you with the &lt;code class=&quot;highlighter-rouge&quot;&gt;EntityTooSmall&lt;/code&gt; error message).&lt;/p&gt;
+
+&lt;p&gt;The solution - if you want to call it one - is to only upload parts to S3 that match or exceed the minimum size. The storage back-end for tusd achieves this by writing the body of an incoming &lt;code class=&quot;highlighter-rouge&quot;&gt;PATCH&lt;/code&gt; request to a temporary file. Once the upload from the user to our tus server reaches a size of 5MB, we are sure that we have enough data for a single part on S3 and can start moving this chunk to Amazon’s service. If the tus server does not receive enough data - ensuring, of course, that it is not the last part, which is allowed to be smaller - it will simply drop the temporarily stored file and require the user to attempt a resume, in the hope that the connection is then more reliable. A look at the &lt;a href=&quot;https://github.com/tus/tusd/blob/bbf706622c7c5234844fbf2b8c5efdbcda1e3861/s3store/s3store.go#L209-L229&quot;&gt;code&lt;/a&gt; that powers the implementation described above, may help to understand this.&lt;/p&gt;
+
+&lt;p&gt;Regrettably, this approach comes with one noticeable downside for the end user: if an upload or resume is interrupted before at least 5MB has reached the tus server, the sent data will be lost and must be retransmitted. Some may ask why we don’t simply locally store the received chunk of data on the tus server, wait for the user to resume the upload and then, once we have enough data, push it to S3. This is certainly a good question, but that solution only works when you can ensure that the resumed request reaches the same tus server as the previously interrupted request. If you are running more than a single tus instance, a special routing mechanism may be required to achieve this. Another option would be to use a second storage medium, such as a shared volume, but that would also need to handle concurrent access correctly.&lt;/p&gt;
+
+&lt;p&gt;If this workaround is not acceptable for your application because you do not want to limit the chunks to 5MB, you may want to reconsider using AWS S3 as a storage back-end, since it simply does not offer the required functionality. However, if you are using an alternative back-end that just exposes an S3-compatible API, it may offer a configuration option to change the minimum size of a single part. Riak CS (Cloud Storage), for example, accepts the &lt;a href=&quot;https://github.com/basho/riak_cs/blob/c0c1012d1c9c691c74c8c5d9f69d388f5047bcd2/src/riak_cs_config.erl#L191-L193&quot;&gt;&lt;code class=&quot;highlighter-rouge&quot;&gt;enforce_multipart_part_size&lt;/code&gt; flag&lt;/a&gt;, which can entirely remove this constraint.&lt;/p&gt;
+
+&lt;h2 id=&quot;s3s-eventual-consistency-model&quot;&gt;S3’s eventual consistency model&lt;/h2&gt;
+
+&lt;p&gt;Amazon’s engineers wanted to provide a highly available service and were therefore unable to offer guaranteed consistency for every operation. They nevertheless do not hide this important property of S3 and instead describe it extensively in their &lt;a href=&quot;http://docs.aws.amazon.com/AmazonS3/latest/dev/Introduction.html#ConsistencyModel&quot;&gt;documentation&lt;/a&gt;. The most interesting sentence for us, the implementers of tus servers, is the following one:&lt;/p&gt;
+
+&lt;blockquote&gt;
+  &lt;p&gt;Amazon S3 does not currently support object locking. If two PUT requests are simultaneously made to the same key, the request with the latest time stamp wins. If this is an issue, you will need to build an object-locking mechanism into your application.&lt;/p&gt;
+&lt;/blockquote&gt;
+
+&lt;p&gt;Locking uploads is an important mechanism to prevent data corruption and tus is not immune to it. Imagine a situation where two clients attempt to resume the same upload at the same offset. If the server simply accepts both requests, the latter one may override the data from the first request, resulting in file corruption or loss. In order to prevent this issue, the server needs to acquire an exclusive lock, e.g. a simple &lt;a href=&quot;https://en.wikipedia.org/wiki/Semaphore_%28programming%29&quot;&gt;semaphore&lt;/a&gt;, on the upload resource before it starts transferring the data and then only release that lock once the data is saved. In this scenario, the server will reject the second request from the client, because a lock cannot be obtained when one is already held.&lt;/p&gt;
+
+&lt;p&gt;Implementing a proper locking mechanism is, however, difficult and gets even more complicated if you are working in an environment with multiple distributed servers. In this case, a service should be used that manages distributed locks while at the same time guaranteeing consistency. For example, proven technologies include &lt;a href=&quot;https://zookeeper.apache.org/doc/r3.1.2/recipes.html#sc_recipes_Locks&quot;&gt;ZooKeeper&lt;/a&gt; or &lt;a href=&quot;https://www.consul.io/docs/commands/lock.html&quot;&gt;Consul&lt;/a&gt;, but not AWS S3 as it does not offer absolute consistency. Since they do promise “read-after-write consistency for PUTS of new objects in your S3 bucket [but only] eventual consistency for overwrite PUTS and DELETES”, this cannot be used to build a distributed lock upon. Therefore, you are recommended to use a third-party system for doing so.&lt;/p&gt;
+
+&lt;p&gt;Another option for preventing concurrent uploading is to put the responsibility on the client’s side by saying it is their task to prevent multiple accesses to the same upload resource. While this may work, this approach is not able to guarantee corruption-free uploads since a client still might send two or even more requests at the same time by accident and the server does not prevent that.&lt;/p&gt;
+
+&lt;h2 id=&quot;finishing-thoughts&quot;&gt;Finishing Thoughts&lt;/h2&gt;
+
+&lt;p&gt;With S3, engineers have an incredibly useful tool for storing data with high availability and scalability. However, it does not present the perfect storage back-end for the tus protocol and requires some workarounds. In the future, we will have a look at other storage system and cloud providers.&lt;/p&gt;
+</content>
+ </entry>
+ 
+ 
+ <entry>
+   <author>
+     <name>Kevin van Zonneveld</name>
+     <email>kevin@transloadit.com</email>
+   </author>
+   <title>tus 1.0 - Changing the future of file uploading</title>
+   <link href="http://tus.io/blog/2015/11/16/tus.1.0"/>
+   <updated>2015-11-16T00:00:00+01:00</updated>
+   <id>http://tus.io/blog/2015/11/16/tus.1.0</id>
+   <content type="html">&lt;p&gt;As time progresses, we share ever larger media files from our phones and desktops. More than often, however, complications arise during this process. Whether it is through servers misbehaving or mobile users switching to a WiFi connection, the outcome is the same: ‘upload interrupted’.&lt;/p&gt;
+
+&lt;p&gt;This is by itself a negative user experience, but it becomes even worse when it happens in the middle of a 2GB upload on a slow connection. And of course, the longer an upload takes, the more exposed it is to poor connections. A failed upload will then have to be retried from the start, if the user even bothers with it at all.&lt;/p&gt;
+
+&lt;p&gt;With media files growing larger and networks remaining fragile, it is clear that we need a better solution to handle uploading.&lt;/p&gt;
+
+&lt;h3 id=&quot;resumable-uploads&quot;&gt;Resumable Uploads&lt;/h3&gt;
+
+&lt;p&gt;Even though certain decent network libraries already implement retries, these do not give the option to resume at the point where the upload was previously interrupted and then only transfer the remaining bytes. Furthermore, these network libraries often require additional user input in order to retry failed uploads. If retries were initiated behind the scenes, the user might not even notice he had an interrupted connection, as the total duration of the upload would barely be impacted.&lt;/p&gt;
+
+&lt;p&gt;There are also many areas in the world where connections are quite poor. In such places, restarting an upload from the beginning usually means that the user only gets to transmit the first 20% of his file, before the connection breaks again. Thus, resuming an upload exactly where it left off is the &lt;em&gt;only&lt;/em&gt; way a large file will ever be uploaded in these cases.&lt;/p&gt;
+
+&lt;p&gt;From this, it is apparent that we &lt;em&gt;need&lt;/em&gt; resumable uploads and therefore we are proud to present tus, the protocol that aims to offer solutions to all of the problems listed above.&lt;/p&gt;
+
+&lt;p&gt;In addition to this, tus has redesigned the process of uploading in such a way that multiple file parts can be sent simultaneously. Using tus not only makes uploading a lot more reliable, but also much faster.&lt;/p&gt;
+
+&lt;h3 id=&quot;havent-other-companies-already-implemented-this&quot;&gt;Haven’t other companies already implemented this?&lt;/h3&gt;
+
+&lt;p&gt;Yes, but we see this as another part of the problem. While there are many implementations that offer resumable uploads, they all solve it in a different way. They are either bound to one language or use case. They are also not as thorough or interoperable as we would like, because they all speak different dialects. Some implementations are supported by others, but that is as far as compatibility goes.&lt;/p&gt;
+
+&lt;p&gt;This is not remotely how an &lt;em&gt;open web&lt;/em&gt; should work.&lt;/p&gt;
+
+&lt;p&gt;Dropbox, Vimeo, Google and AWS all have their own API’s for uploading chunks. Some companies describe their API, but make choices that aren’t suitable for general use and they certainly don’t offer a platform to contribute improvements. If we want to support anything beyond their use case, we are on our own again. This further increases fragmentation and leaves resumable file uploads as a luxury, only to be enjoyed by a few large companies, while it should be the standard method that benefits everyone.&lt;/p&gt;
+
+&lt;h3 id=&quot;tus&quot;&gt;tus&lt;/h3&gt;
+
+&lt;p&gt;tus is a protocol that is fully community-owned. It has been &lt;a href=&quot;https://github.com/tus/tus-resumable-upload-protocol&quot;&gt;developed&lt;/a&gt; using nothing but GitHub and Markdown, and was fueled by a profound motivation - shared by a few passionate high profile developers - to solve this problem once and for all.&lt;/p&gt;
+
+&lt;p&gt;Over the course of two years, we have received suggestions from people working at
+&lt;a href=&quot;https://github.com/tus/tus-resumable-upload-protocol/issues?q=mentions%3Avayam&quot;&gt;Vimeo&lt;/a&gt;,
+&lt;a href=&quot;https://github.com/tus/tus-resumable-upload-protocol/issues?q=mentions%3Atechnoweenie&quot;&gt;GitHub&lt;/a&gt;,
+&lt;a href=&quot;https://github.com/tus/tus-resumable-upload-protocol/issues?q=mentions%3ABaughn&quot;&gt;Google&lt;/a&gt;,
+and from the author of
+&lt;a href=&quot;https://github.com/tus/tus.io/issues?q=mentions%3Ahintjens&quot;&gt;ØMQ&lt;/a&gt;, as well as from the co-authors of
+&lt;a href=&quot;https://github.com/tus/tus-resumable-upload-protocol/issues?q=mentions%3Areschke&quot;&gt;HTTP/1.1&lt;/a&gt; and
+&lt;a href=&quot;https://github.com/tus/tus-resumable-upload-protocol/issues?q=mentions%3Afelixge&quot;&gt;Node.js&lt;/a&gt;.&lt;/p&gt;
+
+&lt;p&gt;It has not always been easy to find consensus and at times we hit deadlocks. In the past few months, however, we have made considerable progress and we are now excited to announce a finalized version 1.0. tus is ready for the world to use.&lt;/p&gt;
+
+&lt;h3 id=&quot;how-does-it-work&quot;&gt;How does it work?&lt;/h3&gt;
+
+&lt;p&gt;Let’s take a quick look at an example of a simple communication between a client and a server speaking tus 1.0:&lt;/p&gt;
+
+&lt;div class=&quot;language-bash highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;&lt;span class=&quot;c&quot;&gt;# Client:&lt;/span&gt;
+&lt;span class=&quot;gp&quot;&gt;&amp;gt; &lt;/span&gt;POST /files HTTP/1.1
+&lt;span class=&quot;gp&quot;&gt;&amp;gt; &lt;/span&gt;Host: tus.example.org
+&lt;span class=&quot;gp&quot;&gt;&amp;gt; &lt;/span&gt;Tus-Resumable: 1.0.0
+&lt;span class=&quot;gp&quot;&gt;&amp;gt; &lt;/span&gt;Content-Length: 0
+&lt;span class=&quot;gp&quot;&gt;&amp;gt; &lt;/span&gt;Upload-Length: 100
+&lt;span class=&quot;gp&quot;&gt;&amp;gt; &lt;/span&gt;Upload-Metadata: filename &lt;span class=&quot;nv&quot;&gt;d29ybGRfZG9taW5hdGlvbl9wbGFuLnBkZg&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;==&lt;/span&gt;
+
+&lt;span class=&quot;c&quot;&gt;# Server:&lt;/span&gt;
+&amp;lt; HTTP/1.1 201 Created
+&amp;lt; Location: http://tus.example.org/files/24e533e02ec3bc40c387f1a0e460e216
+&amp;lt; Tus-Resumable: 1.0.0
+
+&lt;span class=&quot;c&quot;&gt;# Client:&lt;/span&gt;
+&lt;span class=&quot;gp&quot;&gt;&amp;gt; &lt;/span&gt;PATCH /files/24e533e02ec3bc40c387f1a0e460e216 HTTP/1.1
+&lt;span class=&quot;gp&quot;&gt;&amp;gt; &lt;/span&gt;Host: tus.example.org
+&amp;lt; Tus-Resumable: 1.0.0
+&lt;span class=&quot;gp&quot;&gt;&amp;gt; &lt;/span&gt;Content-Type: application/offset+octet-stream
+&lt;span class=&quot;gp&quot;&gt;&amp;gt; &lt;/span&gt;Content-Length: 30
+&lt;span class=&quot;gp&quot;&gt;&amp;gt; &lt;/span&gt;Upload-Offset: 0
+&amp;gt;
+&lt;span class=&quot;gp&quot;&gt;&amp;gt; &lt;/span&gt;&lt;span class=&quot;o&quot;&gt;[&lt;/span&gt;first 30 bytes]
+
+&lt;span class=&quot;c&quot;&gt;# Server:&lt;/span&gt;
+&amp;lt; HTTP/1.1 204 No Content
+&amp;lt; Tus-Resumable: 1.0.0
+&lt;/code&gt;&lt;/pre&gt;
+&lt;/div&gt;
+
+&lt;p&gt;Since tus is a layer on top of HTTP, it is easy to reason about, inspect, extend and deploy in existing projects as well as infra.&lt;/p&gt;
+
+&lt;h3 id=&quot;a-streamlined-core-with-optional-extensions&quot;&gt;A streamlined core with optional extensions&lt;/h3&gt;
+
+&lt;p&gt;The core of the protocol is lightweight, yet well documented and it defines the way in which communication should take place. In addition to this, tus offers extensions such as Checksum, Expiration and Concatenation, which support different use cases and are opt-in.&lt;/p&gt;
+
+&lt;p&gt;To highlight one of the protocol’s extensions: Concatenation allows you to split a 100GB file in 20 parts of 5GB, upload them in parallel, and uses the tus server to stitch them together again. This makes uploads much faster by utilizing the available bandwidth more efficiently. An extra advantage of this method is that individual chunks are considered regular tus uploads, which benefit from all of tus’ features (retries, checksums, etc.).&lt;/p&gt;
+
+&lt;h3 id=&quot;implementations&quot;&gt;Implementations&lt;/h3&gt;
+
+&lt;p&gt;Our aim is to support all major languages and platforms. Alongside the protocol
+we also develop many implementations, so that developers can have drop-in self-hosted resumable
+file uploads at zero cost.&lt;/p&gt;
+
+&lt;p&gt;We currently support the following platforms:&lt;/p&gt;
+
+&lt;ul&gt;
+  &lt;li&gt;&lt;a href=&quot;https://github.com/tus/tusd&quot;&gt;Server in Go&lt;/a&gt;&lt;/li&gt;
+  &lt;li&gt;&lt;a href=&quot;https://github.com/tus/tus-node-server&quot;&gt;Server in ES2015 JavaScript for Node.js&lt;/a&gt;&lt;/li&gt;
+  &lt;li&gt;&lt;a href=&quot;https://github.com/tus/tus-js-client&quot;&gt;Client in JavaScript&lt;/a&gt;&lt;/li&gt;
+  &lt;li&gt;&lt;a href=&quot;https://github.com/tus/TUSKit&quot;&gt;Client for iOS&lt;/a&gt;&lt;/li&gt;
+  &lt;li&gt;&lt;a href=&quot;https://github.com/tus/tus-android-client&quot;&gt;Client for Android&lt;/a&gt;&lt;/li&gt;
+  &lt;li&gt;&lt;a href=&quot;https://github.com/tus/tus-java-client&quot;&gt;Client in Java&lt;/a&gt;&lt;/li&gt;
+&lt;/ul&gt;
+
+&lt;p&gt;Additionally, there are many community provided &lt;a href=&quot;http://www.tus.io/implementations.html&quot;&gt;implementations&lt;/a&gt; in languages such as:
+&lt;a href=&quot;https://github.com/picocandy/rubytus&quot;&gt;Ruby&lt;/a&gt;,
+&lt;a href=&quot;https://github.com/vayam/tuspy&quot;&gt;Python&lt;/a&gt; and
+&lt;a href=&quot;https://github.com/leblanc-simon/php-tus&quot;&gt;PHP&lt;/a&gt;.&lt;/p&gt;
+
+&lt;p&gt;Quality implementations of the protocol licensed MIT might be adopted in the &lt;a href=&quot;https://github.com/tus&quot;&gt;tus organization on GitHub&lt;/a&gt;, making you an official contributor to the project.&lt;/p&gt;
+
+&lt;h3 id=&quot;releasing-version-10&quot;&gt;Releasing version 1.0&lt;/h3&gt;
+
+&lt;p&gt;Today we are proud to announce that we have launched version 1.0 on GitHub by merging &lt;a href=&quot;https://github.com/tus/tus-resumable-upload-protocol/pull/57&quot;&gt;the 1.0 pull request&lt;/a&gt;.&lt;/p&gt;
+
+&lt;p&gt;We consider the protocol to be stable and ready for production!&lt;/p&gt;
+
+&lt;p&gt;The full protocol is published online &lt;a href=&quot;/protocols/resumable-upload.html&quot;&gt;here&lt;/a&gt;.&lt;/p&gt;
+
+&lt;h3 id=&quot;early-adopters&quot;&gt;Early Adopters&lt;/h3&gt;
+
+&lt;p&gt;Early adopters &lt;a href=&quot;https://vimeo.com&quot;&gt;Vimeo&lt;/a&gt; and Transloadit have already announced they will use tus 1.0 as their main protocol for uploading.&lt;/p&gt;
+
+&lt;p&gt;tus is initiated and funded by &lt;a href=&quot;https://transloadit.com&quot;&gt;Transloadit&lt;/a&gt;, but it is community owned and this will never change.&lt;/p&gt;
+
+&lt;p&gt;We encourage anybody who deals with file uploads to have have a look at tus and to consider using it for your next release.&lt;/p&gt;
+
+&lt;h3 id=&quot;special-thanks&quot;&gt;Special Thanks&lt;/h3&gt;
+
+&lt;p&gt;It has taken us the better part of three years and we have had to overcome many obstacles along the way. It is in great part thanks to &lt;a href=&quot;/about.html&quot;&gt;these people&lt;/a&gt; that tus is able to push out a stable release today. A special 
+word of thanks goes out to the talented people that have been instrumental in getting us to where we are today: &lt;a href=&quot;https://felixge.com&quot;&gt;Felix&lt;/a&gt;, &lt;a href=&quot;https://github.com/vayam&quot;&gt;Naren&lt;/a&gt; and &lt;a href=&quot;https://transloadit.com/about#marius&quot;&gt;Marius&lt;/a&gt;. We couldn’t have done tus without you!&lt;/p&gt;
+
+&lt;p&gt;Discuss on &lt;a href=&quot;https://news.ycombinator.com/item?id=10574364&quot;&gt;Hacker News&lt;/a&gt;&lt;/p&gt;
+</content>
+ </entry>
+ 
+ 
+ <entry>
+   <author>
+     <name>Kevin van Zonneveld</name>
+     <email>kevin@transloadit.com</email>
+   </author>
+   <title>Project Status</title>
+   <link href="http://tus.io/blog/2015/09/19/project-status"/>
+   <updated>2015-09-19T00:00:00+02:00</updated>
+   <id>http://tus.io/blog/2015/09/19/project-status</id>
+   <content type="html">&lt;p&gt;Here’s a quick update on the status of the project.&lt;/p&gt;
+
+&lt;h3 id=&quot;section&quot;&gt;1.0&lt;/h3&gt;
+
+&lt;p&gt;We’re finalizing 1.0. Our project
+lead &lt;a href=&quot;https://github.com/Acconut&quot;&gt;Marius Kleidl&lt;/a&gt; has been taking care
+of integrating a large batch of improvements
+that were made by Vimeo’s &lt;a href=&quot;https://github.com/vayam&quot;&gt;Naren Venkataraman&lt;/a&gt; and this team.&lt;/p&gt;
+
+&lt;p&gt;Things still left to do:&lt;/p&gt;
+
+&lt;ul&gt;
+  &lt;li&gt;&lt;a href=&quot;https://github.com/tus/tus-resumable-upload-protocol/issues/59&quot;&gt;Write a Developers Guide&lt;/a&gt;&lt;/li&gt;
+  &lt;li&gt;Gather a &lt;em&gt;final round of feedback&lt;/em&gt; on &lt;a href=&quot;https://github.com/tus/tus-resumable-upload-protocol/pull/57&quot;&gt;the 1.0 proposal&lt;/a&gt;&lt;/li&gt;
+&lt;/ul&gt;
+
+&lt;p&gt;We’re waiting for a &lt;em&gt;final round of feedback&lt;/em&gt; to make sure every last bit
+is taken care of before cementing everything into our first stable release.&lt;/p&gt;
+
+&lt;h3 id=&quot;exposure--swag&quot;&gt;Exposure &amp;amp; Swag&lt;/h3&gt;
+
+&lt;p&gt;To make sure every developer and interested party had their change to chime in,
+we’re trying to get some extra exposure for the project. We’ll be covered
+in the upcoming &lt;a href=&quot;https://changelog.com/&quot;&gt;Changelog&lt;/a&gt; and Transloadit
+is sponsoring conferences to hand out swag and raise tus awareness.&lt;/p&gt;
+
+&lt;p&gt;Swag is also for sale at the new &lt;a href=&quot;http://shop.tus.io/collections/all&quot;&gt;shop.tus.io&lt;/a&gt;. The shop
+currently only features two, pretty expensive, items and we’re working with &lt;a href=&quot;https://www.theprintful.com/&quot;&gt;Printful&lt;/a&gt; to improve on that.
+Know that any profit flows back to the project and our books are open to
+anyone who wants to verify.&lt;/p&gt;
+
+&lt;h3 id=&quot;implementations&quot;&gt;Implementations&lt;/h3&gt;
+
+&lt;p&gt;While 1.0 could potentially still be changed, we don’t expect major changes
+so our official implementations have already been made 1.0 compatible.&lt;/p&gt;
+
+&lt;p&gt;All official projects have been updated to the 1.0 branch already
+for which a big thank you goes out to &lt;a href=&quot;https://github.com/MMasterson&quot;&gt;Mark R. Masterson&lt;/a&gt;
+and Marius who upgraded all of our implementations.&lt;/p&gt;
+
+&lt;p&gt;Marius also added Android and
+standalone Java implementations as official tus projects, and replaced our jQuery
+implementation with a standalone &lt;a href=&quot;https://github.com/tus/tus-js-client&quot;&gt;tus-js-client&lt;/a&gt;.&lt;/p&gt;
+
+&lt;p&gt;If you’re interested in building &amp;amp; maintaining new 1.0 implementations, becoming
+a member of tus core, leave a note here:&lt;/p&gt;
+
+&lt;ul&gt;
+  &lt;li&gt;&lt;a href=&quot;https://github.com/tus/tus-resumable-upload-protocol/issues/67&quot;&gt;More 1.0 implementations&lt;/a&gt;&lt;/li&gt;
+&lt;/ul&gt;
+
+&lt;h3 id=&quot;design&quot;&gt;Design&lt;/h3&gt;
+
+&lt;p&gt;The whole site has been given a new layout by &lt;a href=&quot;https://github.com/fahad19&quot;&gt;Fahad Ibnay Heylaal&lt;/a&gt; and
+a completely new logo was designed by &lt;a href=&quot;https://twitter.com/milan_vuckovic&quot;&gt;Milan Vuckovic&lt;/a&gt;.&lt;/p&gt;
+
+&lt;p&gt;We’re currently working on improving other:&lt;/p&gt;
+
+&lt;ul&gt;
+  &lt;li&gt;&lt;a href=&quot;https://github.com/tus/tus.io/issues&quot;&gt;Design issues&lt;/a&gt;&lt;/li&gt;
+&lt;/ul&gt;
+
+&lt;h3 id=&quot;demo&quot;&gt;Demo&lt;/h3&gt;
+
+&lt;p&gt;Since the first publication of the tus protocol, our website featured a
+&lt;a href=&quot;/demo.html&quot;&gt;demo page&lt;/a&gt; allowing users to see a tus in action, interactively.
+In the past this service had some issues with reliability and browser-support.
+Because of this past, we updated the entire stack used by the demo.&lt;/p&gt;
+
+&lt;p&gt;It now uses our newly created &lt;a href=&quot;https://github.com/tus/tus-js-client&quot;&gt;tus-js-client&lt;/a&gt;
+and we’ve updated the demo page to feature all the browsers &amp;amp; platforms the
+client has been tested to work on.
+The demo page uploads files to a &lt;a href=&quot;https://github.com/tus/tusd&quot;&gt;tusd 1.0&lt;/a&gt;
+server written in Go, that we deploy via the newly created
+&lt;a href=&quot;https://github.com/tus/infra-tusd&quot;&gt;infra-tusd&lt;/a&gt; repository.&lt;/p&gt;
+
+&lt;h3 id=&quot;infra&quot;&gt;Infra&lt;/h3&gt;
+
+&lt;p&gt;Still a work in progress, &lt;a href=&quot;https://github.com/tus/infra-tusd&quot;&gt;infra-tusd&lt;/a&gt;
+uses a powerful combination of &lt;a href=&quot;http://www.ansible.com/&quot;&gt;Ansible&lt;/a&gt; and
+&lt;a href=&quot;https://terraform.io/&quot;&gt;Terraform&lt;/a&gt; to
+spin up fully functioning tus servers with a single command. Every bit
+(except for the AWS &amp;amp; SSH keys) has been added to the repository
+and is publicly available.&lt;/p&gt;
+
+&lt;p&gt;Please each out if you’d like to help us:&lt;/p&gt;
+
+&lt;ul&gt;
+  &lt;li&gt;&lt;a href=&quot;https://github.com/tus/infra-tusd/issues/1&quot;&gt;Add local Vagrant support for testing the Ansible scripts&lt;/a&gt;&lt;/li&gt;
+&lt;/ul&gt;
+
+&lt;h3 id=&quot;adoption&quot;&gt;Adoption&lt;/h3&gt;
+
+&lt;p&gt;Finally, a few big companies have taken an interest
+in tus. tus will always remain open source and community owned, but
+we’re excited that we’re on the path to realizing our mission to
+change how the world does file uploading.&lt;/p&gt;
+
+&lt;p&gt;We’ll have more announcements on this soon!&lt;/p&gt;
+
+&lt;p&gt;If you (plan to) use tus in production, please comment on this issue and get your
+company listed on the tus.io website:&lt;/p&gt;
+
+&lt;ul&gt;
+  &lt;li&gt;&lt;a href=&quot;https://github.com/tus/tus.io/issues/28&quot;&gt;Companies that (plan to) use tus&lt;/a&gt;&lt;/li&gt;
+&lt;/ul&gt;
+</content>
+ </entry>
+ 
+ 
+ <entry>
+   <author>
+     <name>Marius Kleidl</name>
+     <email>marius@transloadit.com</email>
+   </author>
+   <title>Protocol v1.0.0 Prerelease</title>
+   <link href="http://tus.io/blog/2015/02/03/protocol-v1.0.0-prerelease"/>
+   <updated>2015-02-03T20:33:00+01:00</updated>
+   <id>http://tus.io/blog/2015/02/03/protocol-v1.0.0-prerelease</id>
+   <content type="html">&lt;p&gt;More than a year ago the last release, &lt;code class=&quot;highlighter-rouge&quot;&gt;0.2.2&lt;/code&gt; was published. Now the final 1.0
+release is just around the corner introducing breaking changes and a lot of new
+features.&lt;/p&gt;
+
+&lt;p&gt;The major changes towards the core include the addition of the &lt;code class=&quot;highlighter-rouge&quot;&gt;TUS-Resumable&lt;/code&gt;,
+&lt;code class=&quot;highlighter-rouge&quot;&gt;TUS-Max-Size&lt;/code&gt;, &lt;code class=&quot;highlighter-rouge&quot;&gt;TUS-Extension&lt;/code&gt; and &lt;code class=&quot;highlighter-rouge&quot;&gt;TUS-Version&lt;/code&gt; headers while making the first
+one mandatory. All these headers must be returned in the new &lt;code class=&quot;highlighter-rouge&quot;&gt;OPTIONS&lt;/code&gt; request
+in order to enable protocol discovery. In addition the &lt;code class=&quot;highlighter-rouge&quot;&gt;Offset&lt;/code&gt; header must not
+be greater or lower than the current offset for the file.&lt;/p&gt;
+
+&lt;p&gt;The biggest changes were made by introducing the Upload-Expiration,  Checksum,
+Stream, Retries, Termination, Merge and Metadata extensions.&lt;/p&gt;
+
+&lt;p&gt;After all of this work the protocol is now considered stable and ready for use
+in production environments. Speaking of implementations the official
+&lt;a href=&quot;https://github.com/tus/tus-jquery-client/tree/1.0&quot;&gt;&lt;code class=&quot;highlighter-rouge&quot;&gt;tus-jquery-client&lt;/code&gt;&lt;/a&gt; and
+&lt;a href=&quot;https://github.com/tus/tusd/tree/neXT&quot;&gt;&lt;code class=&quot;highlighter-rouge&quot;&gt;tusd&lt;/code&gt;&lt;/a&gt; repositories are currently being
+updated to support the 1.0 release.&lt;/p&gt;
+
+&lt;p&gt;The final 1.0 Release will be published by merging the
+&lt;a href=&quot;https://github.com/tus/tus-resumable-upload-protocol/pull/57&quot;&gt;according pull request&lt;/a&gt;
+on GitHub once these changes are done. Furthermore, last feedback may be
+submitted there to adjust minor things.&lt;/p&gt;
+</content>
+ </entry>
+ 
+ 
+ <entry>
+   <author>
+     <name>Naren Venkataraman</name>
+     <email>naren@doorul.com</email>
+   </author>
+   <title>Protocol v0.2.2</title>
+   <link href="http://tus.io/blog/2014/01/26/protocol-v0.2.2"/>
+   <updated>2014-01-26T10:04:45+01:00</updated>
+   <id>http://tus.io/blog/2014/01/26/protocol-v0.2.2</id>
+   <content type="html">&lt;p&gt;This is a minor protocol release:&lt;/p&gt;
+
+&lt;ul&gt;
+  &lt;li&gt;Add Content-Type to PATCH example.(&lt;a href=&quot;https://github.com/vayam&quot;&gt;Naren Venkataraman&lt;/a&gt;)&lt;/li&gt;
+  &lt;li&gt;s/Final-Length/Entity-Length/g (&lt;a href=&quot;https://github.com/felixge&quot;&gt;Felix Geisendörfer&lt;/a&gt;)&lt;/li&gt;
+  &lt;li&gt;Fix &lt;a href=&quot;https://github.com/tus/tus-resumable-upload-protocol/pull/32&quot;&gt;#31&lt;/a&gt;:
+HEAD request with non-existent resources should return 404 or 403. (&lt;a href=&quot;https://github.com/vayam&quot;&gt;Naren
+Venkataraman&lt;/a&gt;)&lt;/li&gt;
+&lt;/ul&gt;
+
+&lt;p&gt;All patches can be seen &lt;a href=&quot;https://github.com/tus/tus-resumable-upload-protocol/compare/v0.2.1...v0.2.2&quot;&gt;here&lt;/a&gt;.&lt;/p&gt;
+</content>
+ </entry>
+ 
+ 
+ <entry>
+   <author>
+     <name>Felix Geisendörfer</name>
+     <email>felix@transloadit.com</email>
+   </author>
+   <title>Protocol v0.2.1</title>
+   <link href="http://tus.io/blog/2013/05/08/protocol-v0.2.1"/>
+   <updated>2013-05-08T18:42:00+02:00</updated>
+   <id>http://tus.io/blog/2013/05/08/protocol-v0.2.1</id>
+   <content type="html">&lt;p&gt;This is a minor protocol release:&lt;/p&gt;
+
+&lt;ul&gt;
+  &lt;li&gt;Fix &lt;a href=&quot;https://github.com/tus/tus-resumable-upload-protocol/pull/19&quot;&gt;#19&lt;/a&gt;:
+Final-Length header was called Final-Size in one place by accident. (&lt;a href=&quot;https://github.com/vayam&quot;&gt;Naren
+Venkataraman&lt;/a&gt;)&lt;/li&gt;
+  &lt;li&gt;Define that PATCH requests MUST use &lt;code class=&quot;highlighter-rouge&quot;&gt;application/offset+octet-stream&lt;/code&gt; as the
+&lt;code class=&quot;highlighter-rouge&quot;&gt;Content-Type&lt;/code&gt;. (&lt;a href=&quot;https://github.com/felixge&quot;&gt;Felix Geisendörfer&lt;/a&gt;)&lt;/li&gt;
+  &lt;li&gt;Define that &lt;code class=&quot;highlighter-rouge&quot;&gt;Final-Length&lt;/code&gt; values MUST NOT be negative. (&lt;a href=&quot;https://github.com/felixge&quot;&gt;Felix
+Geisendörfer&lt;/a&gt;)&lt;/li&gt;
+&lt;/ul&gt;
+
+&lt;p&gt;All patches can be seen &lt;a href=&quot;https://github.com/tus/tus-resumable-upload-protocol/compare/v0.2...v0.2.1&quot;&gt;here&lt;/a&gt;.&lt;/p&gt;
+</content>
+ </entry>
+ 
+ 
+ <entry>
+   <author>
+     <name>Felix Geisendörfer</name>
+     <email>felix@transloadit.com</email>
+   </author>
+   <title>Protocol v0.2</title>
+   <link href="http://tus.io/blog/2013/05/01/protocol-v0.2"/>
+   <updated>2013-05-01T02:35:00+02:00</updated>
+   <id>http://tus.io/blog/2013/05/01/protocol-v0.2</id>
+   <content type="html">&lt;p&gt;After releasing our first draft a few weeks ago, we received an incredible
+amount of feedback and suggestions. Based on this feedback as well as
+&lt;a href=&quot;http://lists.w3.org/Archives/Public/ietf-http-wg/2013AprJun/0155.html&quot;&gt;discussing&lt;/a&gt;
+the problems with the &lt;a href=&quot;http://trac.tools.ietf.org/wg/httpbis/trac/wiki&quot;&gt;IETF HTTPbis Working
+Group&lt;/a&gt;, we identified a few
+key issues with &lt;a href=&quot;https://github.com/tus/tus-resumable-upload-protocol/blob/v0.1/README.md&quot;&gt;v0.1&lt;/a&gt; of the
+protocol:&lt;/p&gt;
+
+&lt;ul&gt;
+  &lt;li&gt;&lt;code class=&quot;highlighter-rouge&quot;&gt;PUT&lt;/code&gt; requests are not appropiate for transfering partial resources&lt;/li&gt;
+  &lt;li&gt;The &lt;code class=&quot;highlighter-rouge&quot;&gt;Content-Range&lt;/code&gt; and &lt;code class=&quot;highlighter-rouge&quot;&gt;Range&lt;/code&gt; headers are not meant for resuming an
+interrupted resource transfer.&lt;/li&gt;
+&lt;/ul&gt;
+
+&lt;p&gt;After lots of careful thinking, we came up with a new approach that uses:&lt;/p&gt;
+
+&lt;ul&gt;
+  &lt;li&gt;&lt;code class=&quot;highlighter-rouge&quot;&gt;PATCH&lt;/code&gt; instead of &lt;code class=&quot;highlighter-rouge&quot;&gt;PUT&lt;/code&gt;&lt;/li&gt;
+  &lt;li&gt;A new &lt;code class=&quot;highlighter-rouge&quot;&gt;Offset&lt;/code&gt; header used by &lt;code class=&quot;highlighter-rouge&quot;&gt;HEAD&lt;/code&gt; responses and &lt;code class=&quot;highlighter-rouge&quot;&gt;PATCH&lt;/code&gt; requests alike&lt;/li&gt;
+  &lt;li&gt;A &lt;code class=&quot;highlighter-rouge&quot;&gt;Final-Length&lt;/code&gt; header to provide the final file size to the server&lt;/li&gt;
+&lt;/ul&gt;
+
+&lt;p&gt;We also split the protocol into a core protocol which takes care of
+resumability, and nothing else, as well as optional protocol extensions.&lt;/p&gt;
+
+&lt;p&gt;The result of this has just been published as v0.2 can be seen on the &lt;a href=&quot;/protocols/resumable-upload.html&quot;&gt;protocol
+page&lt;/a&gt;. Also included is a new &lt;a href=&quot;/protocols/resumable-upload.html#7&quot;&gt;FAQ
+section&lt;/a&gt; which will expanded over time.&lt;/p&gt;
+
+&lt;p&gt;We feel that the overall result is a drastic simplification of the problem down
+to its essence, and we encourage interested developers to implement prototypes.&lt;/p&gt;
+
+&lt;p&gt;Our next step is upgrading tusd, the jquery client and the ios client to the
+new protocol version. Once the protocol has reached a little more maturity, we
+are also thinking about providing an executable protocol verification tool for
+implementers.&lt;/p&gt;
+</content>
+ </entry>
+ 
+ 
+ <entry>
+   <author>
+     <name>Felix Geisendörfer</name>
+     <email>felix@transloadit.com</email>
+   </author>
+   <title>A protocol for resumable file uploads</title>
+   <link href="http://tus.io/blog/2013/04/15/a-protocol-for-resumable-file-uploads"/>
+   <updated>2013-04-15T17:00:00+02:00</updated>
+   <id>http://tus.io/blog/2013/04/15/a-protocol-for-resumable-file-uploads</id>
+   <content type="html">&lt;p&gt;&lt;strong&gt;tl;dr:&lt;/strong&gt; We are happy to announce version 0.1 of the &lt;a href=&quot;/protocols/resumable-upload.html&quot;&gt;tus resumable upload
+protocol&lt;/a&gt; and are interested in your
+feedback!&lt;/p&gt;
+
+&lt;p&gt;With mobile devices becoming the dominant source of user generated media files,
+reliable file uploading through unreliable mobile networks has become an
+important issue for anybody interested in content acquisition.&lt;/p&gt;
+
+&lt;p&gt;Reliability here means the ability to detect network errors, and resuming an
+upload without having to start from the beginning. In many scenarios this can
+mean the difference between a file reaching your application, or the user
+giving up in frustration.&lt;/p&gt;
+
+&lt;p&gt;Ideally, this should be a trivial feature to add. In reality however, there is
+quite a lack of solutions in this space. Sure, there are a few JavaScript
+libraries that claim to support resumable uploading, but in reality you will
+end up spending a lot of time coming up with your own API for it, or
+implementing a poorly specified one specific to a library. This is incredibly
+frustrating, especially if you are planning to support this feature on multiple
+platforms such as HTML5, iOS and Android.&lt;/p&gt;
+
+&lt;p&gt;Now, if you’re a big company like Google, you may sit down and create such a
+protocol for your needs. And in fact, Google has been working on a &lt;a href=&quot;http://code.google.com/p/gears/wiki/ResumableHttpRequestsProposal&quot;&gt;such a
+protocol&lt;/a&gt;
+since 2010, for the now defunct Google Gears. The latest incarnation of this
+are two incompatible protocols for &lt;a href=&quot;https://developers.google.com/drive/manage-uploads&quot;&gt;Google
+Drive&lt;/a&gt; and
+&lt;a href=&quot;https://developers.google.com/youtube/v3/guides/using_resumable_upload_protocol&quot;&gt;YouTube&lt;/a&gt;.
+But unfortunately both of these protocols rely on a non-standard http status
+code (&lt;code class=&quot;highlighter-rouge&quot;&gt;308 Resume Incomplete&lt;/code&gt;), and are far from being generic enough for
+general adoption.&lt;/p&gt;
+
+&lt;p&gt;This means that smaller companies are currently doomed to invent, implement and
+maintain their own incompatible protocols and solutions for something that
+should be a trivial component of a modern application.&lt;/p&gt;
+
+&lt;p&gt;We find this unacceptable, so the &lt;a href=&quot;http://www.tus.io/&quot;&gt;tus project&lt;/a&gt; is a
+community project that was born in order to level the playing field and make
+resumable file uploading easy for anybody to implement.&lt;/p&gt;
+
+&lt;p&gt;Today we are happy to release version 0.1 of &lt;a href=&quot;/protocols/resumable-upload.html&quot;&gt;our
+protocol&lt;/a&gt;. Interested developers are
+encouraged to experiment with it, and we are very interested in any feedback
+you may have.&lt;/p&gt;
+
+&lt;p&gt;Later this week we will also release some initial clients for
+&lt;a href=&quot;https://github.com/tus/tus-jquery-client&quot;&gt;jQuery&lt;/a&gt; and
+&lt;a href=&quot;https://github.com/tus/TUSKit&quot;&gt;iOS&lt;/a&gt;, so make sure to follow this blog
+and these repositories for future updates!&lt;/p&gt;
+</content>
+ </entry>
+ 
+ 
+ <entry>
+   <author>
+     <name>Kevin van Zonneveld</name>
+     <email>kevin@transloadit.com</email>
+   </author>
+   <title>Hello world</title>
+   <link href="http://tus.io/blog/2013/04/06/hello-world"/>
+   <updated>2013-04-06T22:45:00+02:00</updated>
+   <id>http://tus.io/blog/2013/04/06/hello-world</id>
+   <content type="html">&lt;p&gt;Hey everybody, we’re starting a new blog here to discuss file uploading, and
+the protocol we are working on. So keep an eye on this space!&lt;/p&gt;
+</content>
+ </entry>
+ 
+
+</feed>
+
